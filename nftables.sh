@@ -9,7 +9,7 @@ if [ -z "${BASH_VERSION:-}" ]; then
     exec bash "$0" "$@"
 fi
 
-SCRIPT_VERSION=1.0.5
+SCRIPT_VERSION=1.0.6
 DIR=/root/nftables
 CONF=$DIR/nftables.json
 RULES=$DIR/nftables.nft
@@ -342,7 +342,7 @@ apply_config() (
     fi
     writing=0
     cp -p "$temp/nftables.json" "$CONF.bak" || warn '无法保存上次配置备份'
-    systemctl enable "$SERVICE" >/dev/null || warn '规则已生效，但开机自启设置失败'
+    systemctl --quiet enable "$SERVICE" || warn '规则已生效，但开机自启设置失败'
     success '转发规则已保存并生效'
 )
 start_forwarding() {
@@ -430,7 +430,7 @@ uninstall() {
     confirm || return 1
     if unit_owned; then
         check_unit || return 1
-        systemctl stop "$SERVICE" && systemctl disable "$SERVICE" || return 1
+        systemctl stop "$SERVICE" && systemctl --quiet disable "$SERVICE" || return 1
     fi
     if command -v nft >/dev/null 2>&1; then remove_rules || return 1; fi
     if unit_owned; then rm -f -- "$UNIT" && systemctl daemon-reload || return 1; fi
