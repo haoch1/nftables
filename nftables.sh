@@ -398,7 +398,7 @@ update_script() (
     command -v curl >/dev/null 2>&1 || install_packages curl ca-certificates || exit 1
     temp=$(mktemp "$DIR/.nftables.XXXXXX") || exit 1
     trap 'rm -f -- "$temp"; [[ -z $staged ]] || rm -f -- "$staged"' EXIT
-    curl -fLsS --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 60 "$SCRIPT_URL" -o "$temp" || exit 1
+    curl -fLsS --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 60 "$SCRIPT_URL?$(date +%s)" -o "$temp" || exit 1
     if ! grep -qxF '# nftables.sh managed script' "$temp" || ! bash -n "$temp"; then fail '下载内容无效，原脚本已保留'; exit 1; fi
     [[ ! -e $RT ]] || grep -qxF '# nftables.sh managed script' "$RT" || exit 1
     [[ ! -L $RT ]] || exit 1
