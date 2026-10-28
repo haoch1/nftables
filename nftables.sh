@@ -9,7 +9,7 @@ if [ -z "${BASH_VERSION:-}" ]; then
     exec bash "$0" "$@"
 fi
 
-SCRIPT_VERSION=1.0.1
+SCRIPT_VERSION=1.0.2
 DIR=/root/nftables
 CONF=$DIR/nftables.json
 RULES=$DIR/nftables.nft
@@ -19,7 +19,7 @@ LOCK=/run/lock/nftables.lock
 SCRIPT_URL=https://raw.githubusercontent.com/haoch1/nftables/main/nftables.sh
 MARKER='nftables.sh managed'
 BLUE=$'\033[1;36m' GREEN=$'\033[0;32m' RED=$'\033[0;31m' YELLOW=$'\033[0;33m' NC=$'\033[0m'
-MENU_CANCELLED=0 INPUT_EOF=0
+MENU_CANCELLED=0 INPUT_EOF=0 MENU_IDLE=0
 
 info() { printf '  %s[信息] %s%s\n' "$BLUE" "$*" "$NC"; }
 success() { printf '  %s[成功] %s%s\n' "$GREEN" "$*" "$NC"; }
@@ -41,7 +41,7 @@ confirm() {
 # 只用标准库处理 JSON、地址校验和规则生成，无额外 Python 包。
 config_tool() {
     python3 - "$@" <<'PY'
-import ipaddress, json, re, signal, socket, sys, unicodedata
+import ipaddress, json, re, signal, socket, sys
 
 def port(value):
     if isinstance(value, bool) or not re.fullmatch(r"[0-9]{1,5}", str(value)) or not 1 <= int(value) <= 65535:
@@ -100,19 +100,6 @@ try:
     elif action == 'list':
         for i, rule in enumerate(rules, 1):
             print(f"  [{i}] 【{rule['name']}】 本机 :{rule['listen_port']} → {rule['host']}:{rule['target_port']}  [{rule['protocol'].upper()}]")
-    elif action == 'menu':
-        rows = ['    nftables 端口转发管理', f'    当前规则：{len(rules)} 条    状态：{args[1]}',
-                f'    nft 版本：{args[2]}', f'    管理脚本：v{args[3]}', None,
-                '  基础功能', '  [1]  添加转发规则', '  [2]  查看转发规则', '  [3]  修改转发规则',
-                '  [4]  删除转发规则', '  [5]  清空所有转发规则', '', '  转发管理',
-                '  [6]  启动转发', '  [7]  停止转发', '  [8]  重载转发', '', '  更新与卸载',
-                '  [9]  更新管理脚本', '  [10] 一键卸载', '', '  [0]  退出脚本']
-        def width(text): return sum(2 if unicodedata.east_asian_width(c) in 'WF' else 1 for c in text)
-        size = max(39, *(width(row) + 2 for row in rows if row))
-        print('  ╔' + '═' * size + '╗')
-        for row in rows:
-            print('  ╠' + '═' * size + '╣' if row is None else '  ║' + row + ' ' * (size - width(row)) + '║')
-        print('  ╚' + '═' * size + '╝')
     elif action in ('save', 'delete'): print(json.dumps(config, ensure_ascii=False, indent=2))
     elif action == 'render':
         if hasattr(signal, 'alarm'): signal.alarm(30)
@@ -188,6 +175,47 @@ kernel_lock() {
     mkdir -p /run/lock || return 1
     exec 8>"$LOCK" || return 1
     flock -w 15 8 || { fail '另一个操作正在应用规则，请稍后重试'; return 1; }
+}
+
+# 只接管等待主菜单输入的旧窗口；正在提交配置的窗口不受打断。
+acquire_menu_lock() {
+    local holder='' state='' command='' attempt
+    exec 9>>"$LOCK.menu" || return 1
+    if ! flock -n 9; then
+        read -r holder state <"$LOCK.menu" || true
+        if [[ $holder =~ ^[1-9][0-9]*$ && $state == idle && -r /proc/$holder/cmdline && /proc/$holder/fd/9 -ef $LOCK.menu ]]; then
+            command=$(tr '\0' '\n' <"/proc/$holder/cmdline") || return 1
+            case $command in
+                "bash"$'\n'"$RT" | "/bin/bash"$'\n'"$RT" | "/usr/bin/bash"$'\n'"$RT")
+                    info '检测到旧的空闲管理界面，正在自动接管...'
+                    kill -TERM "$holder" 2>/dev/null || return 1
+                    ;;
+                *) fail '管理锁被其他进程占用，未结束任何进程'; return 1 ;;
+            esac
+        else
+            fail "另一个 nftables 管理窗口正在执行操作${holder:+（PID: $holder）}，请稍后重试"
+            return 1
+        fi
+        for ((attempt=0; attempt<30; attempt++)); do
+            flock -n 9 && break
+            sleep 0.1
+        done
+        flock -n 9 || { fail '旧窗口尚未释放管理锁，请稍后重试'; return 1; }
+    fi
+    printf '%s busy\n' "$$" >"$LOCK.menu" || return 1
+    # 即使状态检查后用户开始操作，也不因接管信号中断写入。
+    trap 'if [[ ${MENU_IDLE:-0} == 1 ]]; then exit 0; fi' TERM HUP
+}
+
+nft_version() {
+    local output
+    if ! command -v nft >/dev/null 2>&1; then printf '未安装'; return; fi
+    output=$(nft --version 2>/dev/null) || { printf '未知'; return; }
+    if [[ $output =~ ^nftables[[:space:]]+v?([0-9]+(\.[0-9]+)+) ]]; then
+        printf '%s' "${BASH_REMATCH[1]}"
+    else
+        printf '未知'
+    fi
 }
 load_rules() (
     # 服务调用另持一把短锁；不与菜单的管理锁互相等待。
@@ -396,18 +424,49 @@ uninstall() {
 }
 
 menu() {
-    local choice index state version
+    local choice index state version count header_pad core_width core_pad script_pad status
     while true; do
         MENU_CANCELLED=0 INPUT_EOF=0
         [[ ! -t 1 ]] || printf '\033[3J\033[2J\033[H'
+        count=$(config_tool count "$CONF") || return 1
         state=已停止
         if ! command -v nft >/dev/null 2>&1; then state=未安装
-        elif table_state >/dev/null 2>&1; then state=转发中; fi
-        version=$(nft --version 2>/dev/null) || version=未安装
-        printf '\n%s' "$BLUE"
-        config_tool menu "$CONF" "$state" "$version" "$SCRIPT_VERSION" || return 1
-        printf '%s\n' "$NC"
-        read_input choice '请输入选项 [0-10]: ' || { ((INPUT_EOF)) && return 0; continue; }
+        elif ((count > 0)) && table_state >/dev/null 2>&1; then state=运行中; fi
+        version=$(nft_version)
+        header_pad=$((6 - ${#count})); ((header_pad > 0)) || header_pad=1
+        case $version in 未安装) core_width=6 ;; 未知) core_width=4 ;; *) core_width=${#version} ;; esac
+        core_pad=$((20 - core_width)); ((core_pad > 0)) || core_pad=1
+        script_pad=$((25 - ${#SCRIPT_VERSION})); ((script_pad > 0)) || script_pad=1
+        printf '\n%s  ╔═══════════════════════════════════════╗\n' "$BLUE"
+        printf '  ║    端口转发管理（当前规则：%s%s%s 条）%*s║\n' "$GREEN" "$count" "$BLUE" "$header_pad" ''
+        printf '  ║    nftables 状态：%s%s%s%14s║\n' "$GREEN" "$state" "$BLUE" ''
+        printf '  ║    nftables 版本：%s%s%s%*s║\n' "$GREEN" "$version" "$BLUE" "$core_pad" ''
+        printf '  ║    管理脚本：%s%s%s%*s║\n' "$GREEN" "$SCRIPT_VERSION" "$BLUE" "$script_pad" ''
+        printf '  ╠═══════════════════════════════════════╣\n'
+        printf '  ║  基础功能%29s║\n' ''
+        printf '  ║  %s[1]%s  添加转发规则%20s║\n' "$GREEN" "$BLUE" ''
+        printf '  ║  %s[2]%s  查看转发规则%20s║\n' "$GREEN" "$BLUE" ''
+        printf '  ║  %s[3]%s  修改转发规则%20s║\n' "$GREEN" "$BLUE" ''
+        printf '  ║  %s[4]%s  删除转发规则%20s║\n' "$GREEN" "$BLUE" ''
+        printf '  ║  %s[5]%s  清空所有转发规则%16s║\n' "$GREEN" "$BLUE" ''
+        printf '  ║%39s║\n' ''
+        printf '  ║  服务管理%29s║\n' ''
+        printf '  ║  %s[6]%s  启动转发%24s║\n' "$GREEN" "$BLUE" ''
+        printf '  ║  %s[7]%s  停止转发%24s║\n' "$GREEN" "$BLUE" ''
+        printf '  ║  %s[8]%s  重启转发%24s║\n' "$GREEN" "$BLUE" ''
+        printf '  ║%39s║\n' ''
+        printf '  ║  更新与卸载%27s║\n' ''
+        printf '  ║  %s[9]%s  更新管理脚本%20s║\n' "$GREEN" "$BLUE" ''
+        printf '  ║  %s[10]%s 一键卸载%24s║\n' "$GREEN" "$BLUE" ''
+        printf '  ║%39s║\n' ''
+        printf '  ║  %s[0]%s  退出脚本%24s║\n' "$GREEN" "$BLUE" ''
+        printf '  ╚═══════════════════════════════════════╝%s\n\n' "$NC"
+        MENU_IDLE=1
+        printf '%s idle\n' "$$" >"$LOCK.menu" || return 1
+        read_input choice '请输入选项 [0-10]: '; status=$?
+        MENU_IDLE=0
+        printf '%s busy\n' "$$" >"$LOCK.menu" || return 1
+        if ((status)); then ((INPUT_EOF)) && return 0; continue; fi
         case $choice in
             1) edit_rule || true ;;
             2) view_rules || true ;;
@@ -444,8 +503,7 @@ main() {
     if [[ ${1:-} == --service-stop ]]; then remove_rules; return $?; fi
     [[ ! -L $DIR && ! -L $CONF && ! -L $RULES ]] || { fail '管理目录或配置是符号链接，未修改'; return 1; }
     mkdir -p "$DIR" /run/lock || return 1
-    exec 9>"$LOCK.menu" || return 1
-    flock -n 9 || { fail '另一个 nftables 管理窗口正在运行'; return 1; }
+    acquire_menu_lock || return 1
     if [[ ! -e $CONF ]]; then printf '{"version":1,"rules":[]}\n' >"$CONF" || return 1; fi
     config_tool validate "$CONF" || return 1
     case ${1:-} in
