@@ -9,10 +9,11 @@ if [ -z "${BASH_VERSION:-}" ]; then
     exec bash "$0" "$@"
 fi
 
-SCRIPT_VERSION=1.0.7
+SCRIPT_VERSION=1.0.8
 DIR=/root/nftables
 CONF=$DIR/nftables.json
 RULES=$DIR/nftables.nft
+PENDING=$DIR/nftables.pending
 RT=/usr/local/bin/n
 SERVICE=nftables-forward
 UNIT=/etc/systemd/system/$SERVICE.service
@@ -41,7 +42,7 @@ confirm() {
 
 # 只用标准库处理 JSON、地址校验和规则生成，无额外 Python 包。
 config_tool() {
-    python3 - "$@" <<'PY'
+    python3 - "$@" 8>&- 9>&- <<'PY'
 import ipaddress, json, re, signal, socket, sys
 
 def port(value):
@@ -65,9 +66,24 @@ def host(value):
 
 try:
     action, *args = sys.argv[1:]
-    if action == 'owned':
+    if action in ('owned', 'flows'):
         data = json.loads(args[0])
-        assert any(x.get('table', {}).get('comment') == 'nftables.sh managed' for x in data['nftables']), '同名表不属于本脚本'
+        assert any(x.get('table', {}).get('family') == 'ip' and x['table'].get('name') == 'nftables' and x['table'].get('comment') == 'nftables.sh managed' for x in data['nftables']), '同名表不属于本脚本'
+        if action == 'flows':
+            for entry in data['nftables']:
+                rule = entry.get('rule', {})
+                if rule.get('chain') != 'prerouting': continue
+                proto = listen = address = target = None
+                for expr in rule.get('expr', []):
+                    match = expr.get('match', {})
+                    payload = match.get('left', {}).get('payload', {})
+                    if match.get('op') == '==' and payload.get('field') == 'dport':
+                        proto, listen = payload.get('protocol'), match.get('right')
+                    if 'dnat' in expr:
+                        address, target = expr['dnat'].get('addr'), expr['dnat'].get('port')
+                if address is None: continue
+                assert str(rule.get('comment', '')).startswith('nftables:') and proto in ('tcp', 'udp'), '托管表包含无法识别的转发规则'
+                print(proto, port(listen), host(address), port(target), sep='\t')
         sys.exit(0)
     if action == 'input':
         port(args[0]); host(args[1]); port(args[2])
@@ -143,12 +159,13 @@ install_packages() {
 ensure_tools() {
     local tool package
     local -a packages=()
-    for tool in nft python3 flock ss sysctl; do
+    for tool in nft python3 flock ss sysctl conntrack; do
         command -v "$tool" >/dev/null 2>&1 && continue
         case $tool in
             nft) package=nftables ;; python3) package=python3 ;; flock) package=util-linux ;;
             ss) package=iproute2; command -v apt-get >/dev/null 2>&1 || package=iproute ;;
             sysctl) package=procps; command -v apt-get >/dev/null 2>&1 || package=procps-ng ;;
+            conntrack) package=conntrack; command -v apt-get >/dev/null 2>&1 || package=conntrack-tools ;;
         esac
         packages+=("$package")
     done
@@ -187,6 +204,40 @@ kernel_lock() {
     mkdir -p /run/lock || return 1
     exec 8>"$LOCK" || return 1
     flock -w 15 8 || { fail '另一个操作正在应用规则，请稍后重试'; return 1; }
+    [[ /proc/$BASHPID/fd/8 -ef $LOCK ]] || { fail '运行锁已更新，请重新运行 n'; return 1; }
+}
+
+connection_filters() {
+    local json
+    json=$(nft -j list table ip nftables) || return 1
+    config_tool flows "$json"
+}
+queue_connections() {
+    [[ -n $1 ]] || return 0
+    [[ ! -L $DIR && ! -L $PENDING ]] || { fail '连接清理记录路径异常，未修改'; return 1; }
+    mkdir -p "$DIR" || return 1
+    printf '%s\n' "$1" >>"$PENDING" && LC_ALL=C sort -u "$PENDING" -o "$PENDING"
+}
+clear_connections() {
+    [[ ! -L $PENDING ]] || { fail '连接清理记录是符号链接，未修改'; return 1; }
+    [[ -s $PENDING ]] || return 0
+    local package=conntrack protocol port address target output remaining
+    local -a filters
+    if ! command -v conntrack >/dev/null 2>&1; then
+        command -v apt-get >/dev/null 2>&1 || package=conntrack-tools
+        install_packages "$package" 8>&- 9>&- || return 1
+    fi
+    while read -r protocol port address target; do
+        [[ -n $protocol ]] || continue
+        if [[ $protocol != tcp && $protocol != udp ]] || ! valid_port "$port" || ! valid_port "$target" || [[ ! $address =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+            fail '连接清理记录无效，已保留供检查'; return 1
+        fi
+        filters=(-p "$protocol" --dport "$port" --reply-src "$address" --reply-port-src "$target" --dst-nat)
+        output=$(LC_ALL=C conntrack -D "${filters[@]}" 2>&1) || true
+        remaining=$(LC_ALL=C conntrack -L "${filters[@]}" 2>/dev/null) || { fail "无法验证旧连接是否清除：$output"; return 1; }
+        [[ -z $remaining ]] || { fail "端口 $port 的旧转发连接未清理完成，已保留记录供重试"; return 1; }
+    done <"$PENDING"
+    rm -f -- "$PENDING"
 }
 
 # 只接管等待主菜单输入的旧窗口；正在提交配置的窗口不受打断。
@@ -214,6 +265,7 @@ acquire_menu_lock() {
         done
         flock -n 9 || { fail '旧窗口尚未释放管理锁，请稍后重试'; return 1; }
     fi
+    [[ /proc/$BASHPID/fd/9 -ef $LOCK.menu ]] || { fail '管理锁已更新，请重新运行 n'; return 1; }
     printf '%s busy\n' "$$" >"$LOCK.menu" || return 1
     # 即使状态检查后用户开始操作，也不因接管信号中断写入。
     trap 'if [[ ${MENU_IDLE:-0} == 1 ]]; then exit 0; fi' TERM HUP
@@ -232,15 +284,18 @@ nft_version() {
 load_rules() (
     # 服务调用另持一把短锁；不与菜单的管理锁互相等待。
     kernel_lock || exit 1
-    local source=${1:-$RULES} state batch previous=''
+    local source=${1:-$RULES} state batch previous='' old='' current removed count
+    count=$(config_tool count "$CONF") || exit 1
+    clear_connections || exit 1
     table_state; state=$?
     ((state < 2)) || exit 1
+    if ((state == 0)); then old=$(connection_filters) || exit 1; fi
     batch=$(mktemp "$DIR/.nftables.XXXXXX") || exit 1
     trap 'rm -f -- "$batch"' EXIT
     ((state == 0)) && printf 'delete table ip nftables\n' >"$batch"
     cat "$source" >>"$batch" || exit 1
     nft -c -f "$batch" || exit 1
-    if [[ $(config_tool count "$CONF") != 0 ]]; then
+    if ((count)); then
         previous=$(sysctl -n net.ipv4.ip_forward) || exit 1
         sysctl -q -w net.ipv4.ip_forward=1 || exit 1
     fi
@@ -248,14 +303,20 @@ load_rules() (
         [[ -z $previous || $previous == 1 ]] || sysctl -q -w "net.ipv4.ip_forward=$previous"
         exit 1
     fi
+    current=$(connection_filters) || exit 1
+    removed=$(LC_ALL=C comm -23 <(printf '%s\n' "$old" | LC_ALL=C sort -u) <(printf '%s\n' "$current" | LC_ALL=C sort -u)) || exit 1
+    queue_connections "$removed" && clear_connections
 )
 remove_rules() (
     kernel_lock || exit 1
-    local state
+    local state filters
     table_state; state=$?
     case $state in
-        0) nft delete table ip nftables ;;
-        1) return 0 ;;
+        0)
+            filters=$(connection_filters) || exit 1
+            queue_connections "$filters" && nft delete table ip nftables && clear_connections
+            ;;
+        1) clear_connections ;;
         *) return 1 ;;
     esac
 )
@@ -541,18 +602,36 @@ uninstall() {
     info '=== 一键卸载 nftables ==='
     printf '\n'
     confirm "${YELLOW}[注意] 卸载将删除管理脚本、全部规则和备份，是否继续？(Y/N): ${NC}" || return 1
+    command -v nft >/dev/null 2>&1 || install_packages nftables || return 1
     if unit_owned; then
         check_unit || return 1
         systemctl stop "$SERVICE" && systemctl --quiet disable "$SERVICE" || return 1
     fi
-    if command -v nft >/dev/null 2>&1; then remove_rules || return 1; fi
+    remove_rules || return 1
     if unit_owned; then rm -f -- "$UNIT" && systemctl daemon-reload || return 1; fi
-    rm -f -- "$CONF" "$CONF.bak" "$RULES" || return 1
-    if [[ -f $DIR/nftables.sh.bak && ! -L $DIR/nftables.sh.bak ]] && grep -qxF '# nftables.sh managed script' "$DIR/nftables.sh.bak"; then rm -f -- "$DIR/nftables.sh.bak" || return 1; fi
-    if [[ -f $RT && ! -L $RT ]] && grep -qxF '# nftables.sh managed script' "$RT"; then rm -f -- "$RT" || return 1; fi
-    rmdir -- "$DIR" 2>/dev/null || warn "$DIR 内的未识别文件已保留"
-    # 锁文件保留：删除已锁定的 inode 会允许另一个进程绕过互斥。
-    printf '  卸载完成：服务、规则、备份和 n 命令已清理\n'
+    (
+        kernel_lock || exit 1
+        table_state
+        local state=$?
+        [[ $state == 1 ]] || { fail '内核规则未确认清理完成，卸载中止'; exit 1; }
+        rm -f -- "$CONF" "$CONF.bak" "$RULES" "$PENDING" || exit 1
+        if [[ -f $DIR/nftables.sh.bak && ! -L $DIR/nftables.sh.bak ]] && grep -qxF '# nftables.sh managed script' "$DIR/nftables.sh.bak"; then rm -f -- "$DIR/nftables.sh.bak" || exit 1; fi
+        if [[ -f $RT && ! -L $RT ]] && grep -qxF '# nftables.sh managed script' "$RT"; then rm -f -- "$RT" || exit 1; fi
+        local temp
+        for temp in "$DIR"/.nftables.??????; do
+            [[ -e $temp || -L $temp ]] || continue
+            rm -rf -- "$temp" || exit 1
+        done
+        for temp in "${RT%/*}"/.nftables.??????; do
+            [[ -f $temp && ! -L $temp ]] || continue
+            grep -qxF '# nftables.sh managed script' "$temp" || continue
+            rm -f -- "$temp" || exit 1
+        done
+        rmdir -- "$DIR" 2>/dev/null || warn "$DIR 内的未识别文件已保留"
+        rm -f -- "$LOCK" "$LOCK.menu" || exit 1
+        exec 8>&- 9>&-
+        printf '  卸载完成：服务、规则、旧连接、备份和 n 命令已清理\n'
+    )
 }
 
 menu() {
