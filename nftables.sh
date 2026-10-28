@@ -9,11 +9,11 @@ if [ -z "${BASH_VERSION:-}" ]; then
     exec bash "$0" "$@"
 fi
 
-SCRIPT_VERSION=1.0.0
+SCRIPT_VERSION=1.0.1
 DIR=/root/nftables
 CONF=$DIR/nftables.json
 RULES=$DIR/nftables.nft
-RT=/usr/local/bin/nftables
+RT=/usr/local/bin/n
 UNIT=/etc/systemd/system/nftables.service
 LOCK=/run/lock/nftables.lock
 SCRIPT_URL=https://raw.githubusercontent.com/haoch1/nftables/main/nftables.sh
@@ -229,7 +229,7 @@ prepare_service() {
     local self
     self=$(readlink -f -- "${BASH_SOURCE[0]}") || return 1
     [[ $self == "$RT" ]] || install -m 755 -- "$self" "$RT" || return 1
-    if ! unit_owned; then
+    if ! unit_owned || ! grep -qxF "ExecStart=$RT --service-start" "$UNIT"; then
         cat >"$UNIT" <<EOF
 # $MARKER
 [Unit]
@@ -376,7 +376,7 @@ update_script() (
     [[ ! -L $RT ]] || exit 1
     staged=$(mktemp "${RT%/*}/.nftables.XXXXXX") || exit 1
     install -m 755 "$temp" "$staged" && mv -f -- "$staged" "$RT" || exit 1
-    success '管理脚本已更新，下次运行 nftables 时加载'
+    success '管理脚本已更新，下次运行 n 时加载'
 )
 uninstall() {
     warn '卸载仅删除本脚本的转发表、配置、服务和管理命令。'
@@ -428,7 +428,7 @@ menu() {
 main() {
     case ${1:-} in
         --version|-v) printf 'nftables 管理脚本 v%s\n' "$SCRIPT_VERSION"; return 0 ;;
-        --help|-h) printf '用法：nftables [--start|--stop|--reload|--update-script|--uninstall|--version]\n无参数打开菜单；q/Q 取消输入。\n'; return 0 ;;
+        --help|-h) printf '用法：n [--start|--stop|--reload|--update-script|--uninstall|--version]\n无参数打开菜单；q/Q 取消输入。\n'; return 0 ;;
         ''|--start|--stop|--reload|--update-script|--uninstall|--service-start|--service-stop) ;;
         *) fail '未知参数，请使用 --help'; return 1 ;;
     esac
