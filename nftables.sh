@@ -9,7 +9,7 @@ if [ -z "${BASH_VERSION:-}" ]; then
     exec bash "$0" "$@"
 fi
 
-SCRIPT_VERSION=1.0.6
+SCRIPT_VERSION=1.0.7
 DIR=/root/nftables
 CONF=$DIR/nftables.json
 RULES=$DIR/nftables.nft
@@ -35,7 +35,7 @@ read_input() {
 pause_enter() { read -r -p "${1:-  按回车返回主菜单...}" _ || INPUT_EOF=1; }
 confirm() {
     local answer
-    read_input answer '(Y/N): ' || return 1
+    read_input answer "${1:-(Y/N): }" || return 1
     [[ $answer == [yY] ]] || { MENU_CANCELLED=1; return 1; }
 }
 
@@ -72,6 +72,10 @@ try:
     if action == 'input':
         port(args[0]); host(args[1]); port(args[2])
         sys.exit(0)
+    if action == 'resolve':
+        if hasattr(signal, 'alarm'): signal.alarm(5)
+        print(host(socket.getaddrinfo(host(args[0]), None, socket.AF_INET, socket.SOCK_STREAM)[0][4][0]))
+        sys.exit(0)
     with open(args[0], encoding='utf-8') as file:
         config = json.load(file)
     assert isinstance(config, dict) and config.get('version') == 1 and isinstance(config.get('rules'), list), '配置格式不正确'
@@ -92,7 +96,7 @@ try:
         assert rule['protocol'] in ('tcp', 'udp', 'tcp+udp'), '无效协议'
         assert isinstance(rule['name'], str) and 0 < len(rule['name']) <= 60 and not any(ord(c) < 32 or ord(c) == 127 for c in rule['name']), '备注限 60 字，不能包含控制字符'
         for proto in rule['protocol'].split('+'):
-            assert (listen, proto) not in occupied, f'{listen}/{proto} 已有转发规则'
+            assert (listen, proto) not in occupied, f"{rule['protocol'].upper()} 端口 {listen} 已有转发规则"
             occupied.add((listen, proto))
     if action == 'count': print(len(rules))
     elif action == 'get':
@@ -100,7 +104,7 @@ try:
         for key in ('listen_port', 'host', 'target_port', 'protocol', 'name'): print(rule[key])
     elif action == 'list':
         for i, rule in enumerate(rules, 1):
-            print(f"  [{i}] 【{rule['name']}】 本机 :{rule['listen_port']} → {rule['host']}:{rule['target_port']}  [{rule['protocol'].upper()}]")
+            print('\t'.join(map(str, (i, rule['name'], rule['listen_port'], f"{rule['host']}:{rule['target_port']}", rule['protocol'].upper()))))
     elif action in ('save', 'delete'): print(json.dumps(config, ensure_ascii=False, indent=2))
     elif action == 'render':
         if hasattr(signal, 'alarm'): signal.alarm(30)
@@ -109,7 +113,6 @@ try:
             addresses = socket.getaddrinfo(rule['host'], None, socket.AF_INET, socket.SOCK_STREAM)
             address = host(addresses[0][4][0])
             listen, target = port(rule['listen_port']), port(rule['target_port'])
-            print(f"  【{rule['name']}】 {rule['host']} → {address}", file=sys.stderr)
             for proto in rule['protocol'].split('+'):
                 pre.append(f'    fib daddr type local {proto} dport {listen} counter dnat to {address}:{target} comment "nftables:{i}"')
                 post.append(f'    ct status dnat ct original proto-dst {listen} ip daddr {address} {proto} dport {target} counter masquerade')
@@ -343,71 +346,172 @@ apply_config() (
     writing=0
     cp -p "$temp/nftables.json" "$CONF.bak" || warn '无法保存上次配置备份'
     systemctl --quiet enable "$SERVICE" || warn '规则已生效，但开机自启设置失败'
-    success '转发规则已保存并生效'
 )
 start_forwarding() {
+    local action=${1:-启动}
     check_unit && ensure_tools || return 1
-    apply_config "$CONF"
+    apply_config "$CONF" || return 1
+    success "转发已${action}"
 }
 stop_forwarding() {
     check_unit || return 1
     if unit_owned; then systemctl stop "$SERVICE" || return 1; fi
     command -v nft >/dev/null 2>&1 && remove_rules || return 1
-    success '转发已停止，保存的规则仍保留；已有连接可能继续到过期'
+    success '转发已停止'
 }
 
-view_rules() { printf '\n'; info '=== 当前端口转发规则 ==='; config_tool list "$CONF"; }
-choose_rule() {
-    local selection count
+print_rules() {
+    local index name port remote protocol
+    while IFS=$'\t' read -r index name port remote protocol; do
+        printf '  %s[%s]%s 【%s】 本机 :%s%s%s → %s%s%s  %s[%s]%s\n' \
+            "$GREEN" "$index" "$NC" "$name" "$BLUE" "$port" "$NC" \
+            "$BLUE" "$remote" "$NC" "$YELLOW" "$protocol" "$NC"
+    done < <(config_tool list "$CONF")
+}
+view_rules() {
+    local count
     count=$(config_tool count "$CONF") || return 1
+    printf '\n'
+    info '=== 当前端口转发规则 ==='
+    printf '\n'
+    if ((count == 0)); then warn '暂无转发规则'; return 0; fi
+    print_rules
+    printf '\n  共 %s%s%s 条转发规则\n' "$GREEN" "$count" "$NC"
+}
+choose_rule() {
+    local result=$1 action=${2:-选择} selection count
+    count=$(config_tool count "$CONF") || return 1
+    printf '\n'
+    info "=== ${action}端口转发规则 ==="
+    printf '\n'
     ((count)) || { warn '暂无转发规则'; return 1; }
-    view_rules
-    read_input selection "请输入要$2的序号 (0 取消): " || return 1
+    print_rules
+    printf '\n'
+    read_input selection "请输入要${action}的序号 (0 取消): " || return 1
     [[ -n $selection && $selection != 0 ]] || { MENU_CANCELLED=1; return 1; }
     if [[ ! $selection =~ ^[0-9]{1,5}$ ]] || ((10#$selection < 1 || 10#$selection > count)); then fail '无效选择'; return 1; fi
-    printf -v "$1" '%d' "$((10#$selection - 1))"
+    printf -v "$result" '%d' "$((10#$selection - 1))"
+}
+valid_port() { [[ $1 =~ ^[0-9]{1,5}$ ]] && ((10#$1 >= 1 && 10#$1 <= 65535)); }
+read_port() {
+    local result=$1 label=$2 previous=${3:-} input
+    while true; do
+        read_input input "${label}${previous:+ (回车保持 $previous)}: " || return 1
+        input=${input:-$previous}
+        if valid_port "$input"; then
+            printf -v "$result" '%d' "$((10#$input))"
+            return 0
+        fi
+        fail '无效端口，请输入 1–65535 之间的数字'
+    done
+}
+choose_protocol() {
+    local result=$1 current=${2:-} choice selected prompt='请选择 [1-3] (默认 1): '
+    printf '\n  %s请选择转发协议：%s\n' "$BLUE" "$NC" >&2
+    printf '    %s[1]%s 仅 TCP\n    %s[2]%s 仅 UDP\n    %s[3]%s TCP+UDP\n' "$GREEN" "$NC" "$GREEN" "$NC" "$GREEN" "$NC" >&2
+    if [[ -n $current ]]; then
+        printf '    %s[0]%s 保持 %s\n' "$GREEN" "$NC" "${current^^}" >&2
+        prompt='请选择 [0-3] (回车不改): '
+    fi
+    while true; do
+        read_input choice "$prompt" || return 1
+        case $choice in
+            '') selected=${current:-tcp} ;; 0) selected=$current ;;
+            1) selected=tcp ;; 2) selected=udp ;; 3) selected=tcp+udp ;; *) selected='' ;;
+        esac
+        if [[ -n $selected ]]; then printf -v "$result" '%s' "$selected"; return 0; fi
+        fail '无效选择，请重新输入'
+    done
+}
+show_resolution() {
+    local host=$1 address
+    [[ ! $host =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 0
+    if address=$(config_tool resolve "$host" 2>/dev/null); then
+        success "域名已解析: $host -> $address (ipv4)"
+    else
+        warn "域名解析失败: $host，暂未获取到可用的 IP，可继续填写"
+    fi
+}
+save_rule() {
+    local index=$1 port=$2 host=$3 target=$4 protocol=$5 name=${6:-} temp status error
+    name=${name:-转发规则-$port}
+    [[ ${#name} -le 60 && ! $name =~ [[:cntrl:]] ]] || { fail '备注限 60 字，不能包含控制字符'; return 1; }
+    check_unit && ensure_tools || return 1
+    temp=$(mktemp "$DIR/.nftables.XXXXXX") || return 1
+    if error=$(config_tool save "$CONF" "$index" "$port" "$host" "$target" "$protocol" "$name" 2>&1 >"$temp"); then
+        apply_config "$temp"; status=$?
+    else
+        fail "${error#配置错误：}"; status=1
+    fi
+    rm -f -- "$temp"
+    if ((status == 0)); then
+        if ((index < 0)); then success '端口转发规则已添加并生效'; else success '转发规则已修改并生效'; fi
+        printf '  转发模式: %s%s%s\n' "$GREEN" "${protocol^^}" "$NC"
+        printf '  【%s】 本机端口: %s%s%s → 目标: %s%s:%s%s\n' "$name" "$GREEN" "$port" "$NC" "$GREEN" "$host" "$target" "$NC"
+    fi
+    return "$status"
 }
 edit_rule() {
-    local index=${1:--1} port='' host='' target='' protocol=tcp name='' value temp
+    local index=${1:--1} port='' host='' target='' protocol='' name='' value h error
+    local host_prompt='请输入目标地址 (IP 或域名): ' target_label='请输入目标端口'
     local -a old
     if ((index >= 0)); then
         mapfile -t old < <(config_tool get "$CONF" "$index")
         port=${old[0]} host=${old[1]} target=${old[2]} protocol=${old[3]} name=${old[4]}
+        printf '\n  当前规则: 【%s】 本机 :%s%s%s → %s%s:%s%s  [%s%s%s]\n\n' \
+            "$name" "$BLUE" "$port" "$NC" "$BLUE" "$host" "$target" "$NC" "$YELLOW" "${protocol^^}" "$NC"
+        read_input value "新备注名称 (回车保持 $name): " || return 1
+        name=${value:-$name}
+        read_port port '新本机监听端口' "$port" || return 1
+        host_prompt="新目标地址 (回车保持 $host): "
+        target_label='新目标端口'
+    else
+        printf '\n'; info '=== 添加端口转发规则 ==='; printf '\n'
+        read_port port '请输入本机监听端口' || return 1
     fi
-    printf '\n'; info '=== 编辑端口转发规则（q 取消）==='; printf '\n'
-    read_input value "本机监听端口${port:+ (回车保持 $port)}: " || return 1; port=${value:-$port}
-    read_input value "目标 IPv4 或域名${host:+ (回车保持 $host)}: " || return 1; host=${value:-$host}
-    read_input value "目标端口${target:+ (回车保持 $target)}: " || return 1; target=${value:-$target}
-    config_tool input "$port" "$host" "$target" || return 1
-    printf '\n  [1] 仅 TCP   [2] 仅 UDP   [3] TCP+UDP\n'
-    read_input value "请选择协议 (回车保持 ${protocol^^}): " || return 1
-    case $value in ''|0) ;; 1) protocol=tcp ;; 2) protocol=udp ;; 3) protocol=tcp+udp ;; *) fail '无效协议'; return 1 ;; esac
-    read_input value "备注名称 (回车${name:+保持 }${name:-默认 转发规则-$port}): " || return 1; name=${value:-$name}
-    check_unit && ensure_tools || return 1
-    temp=$(mktemp "$DIR/.nftables.XXXXXX") || return 1
-    config_tool save "$CONF" "$index" "$port" "$host" "$target" "$protocol" "$name" >"$temp" && apply_config "$temp"
-    local status=$?
-    rm -f -- "$temp"
-    return "$status"
+    while true; do
+        read_input h "$host_prompt" || return 1
+        h=${h:-$host}
+        if error=$(config_tool input 1 "$h" 1 2>&1); then host=$h; break; fi
+        fail "${error#配置错误：}"
+    done
+    show_resolution "$host" || return 1
+    read_port target "$target_label" "$target" || return 1
+    choose_protocol protocol "$protocol" || return 1
+    if ((index < 0)); then read_input name "请输入备注名称 (回车默认: 转发规则-$port): " || return 1; fi
+    save_rule "$index" "$port" "$host" "$target" "$protocol" "$name"
 }
 delete_rule() {
-    local index=$1 temp status
-    [[ $(config_tool count "$CONF") != 0 ]] || { warn '暂无转发规则'; return 0; }
-    if ((index == -1)); then warn '确认清空全部转发规则？'; else warn "确认删除第 $((index + 1)) 条转发规则？"; fi
-    confirm || return 1
+    local index=$1 temp status count selected_port
+    local -a selected
+    count=$(config_tool count "$CONF") || return 1
+    ((count)) || { warn '暂无转发规则'; return 0; }
+    if ((index == -1)); then
+        printf '\n'; warn "确认清空全部 ${count} 条端口转发规则？"
+        confirm || return 1
+    else
+        mapfile -t selected < <(config_tool get "$CONF" "$index")
+        selected_port=${selected[0]}
+    fi
     temp=$(mktemp "$DIR/.nftables.XXXXXX") || return 1
     config_tool delete "$CONF" "$index" >"$temp" && check_unit && ensure_tools && apply_config "$temp"
     status=$?
     rm -f -- "$temp"
+    if ((status == 0)); then
+        if ((index == -1)); then success '所有端口转发规则已清空'; else success "已删除端口 ${selected_port} 的转发规则"; fi
+    fi
     return "$status"
 }
 
 update_script() (
-    local temp staged='' downloaded
+    local temp staged='' downloaded new_hash old_hash
     command -v curl >/dev/null 2>&1 || install_packages curl ca-certificates || exit 1
     temp=$(mktemp "$DIR/.nftables.XXXXXX") || exit 1
     trap 'rm -f -- "$temp"; [[ -z $staged ]] || rm -f -- "$staged"' EXIT
-    curl -fLsS --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 60 "$SCRIPT_URL?$(date +%s)" -o "$temp" || exit 1
+    info '正在检查管理脚本更新'
+    curl -fLsS --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 60 "$SCRIPT_URL?$(date +%s)" -o "$temp" || {
+        fail '管理脚本下载失败，请检查 GitHub 连接'; exit 1
+    }
     if ! grep -qxF '# nftables.sh managed script' "$temp" || ! bash -n "$temp"; then fail '下载内容无效，原脚本已保留'; exit 1; fi
     downloaded=$(sed -n 's/^SCRIPT_VERSION=//p' "$temp")
     [[ $downloaded =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { fail '下载脚本版本无效，原脚本已保留'; exit 1; }
@@ -416,18 +520,27 @@ update_script() (
     fi
     [[ ! -e $RT ]] || grep -qxF '# nftables.sh managed script' "$RT" || exit 1
     [[ ! -L $RT ]] || exit 1
+    if [[ -f $RT ]]; then
+        new_hash=$(sha256sum "$temp") || exit 1
+        old_hash=$(sha256sum "$RT") || exit 1
+        if [[ ${new_hash%% *} == "${old_hash%% *}" ]]; then
+            info "管理脚本已是最新版本 $downloaded"
+            exit 0
+        fi
+    fi
     staged=$(mktemp "${RT%/*}/.nftables.XXXXXX") || exit 1
     install -m 755 "$temp" "$staged" && mv -f -- "$staged" "$RT" || exit 1
-    success '管理脚本已更新'
+    success "管理脚本已更新至 $downloaded"
 )
 reload_script() {
     exec 9>&-
     exec bash "$RT"
 }
 uninstall() {
-    warn '卸载仅删除本脚本的转发表、配置、服务和管理命令。'
-    warn '保留 Linux 内核、系统 nft 工具、其他防火墙规则及共享转发参数。'
-    confirm || return 1
+    printf '\n'
+    info '=== 一键卸载 nftables ==='
+    printf '\n'
+    confirm "${YELLOW}[注意] 卸载将删除管理脚本、全部规则和备份，是否继续？(Y/N): ${NC}" || return 1
     if unit_owned; then
         check_unit || return 1
         systemctl stop "$SERVICE" && systemctl --quiet disable "$SERVICE" || return 1
@@ -439,7 +552,7 @@ uninstall() {
     if [[ -f $RT && ! -L $RT ]] && grep -qxF '# nftables.sh managed script' "$RT"; then rm -f -- "$RT" || return 1; fi
     rmdir -- "$DIR" 2>/dev/null || warn "$DIR 内的未识别文件已保留"
     # 锁文件保留：删除已锁定的 inode 会允许另一个进程绕过互斥。
-    success '已卸载本脚本，系统内核和 nft 工具已保留'
+    printf '  卸载完成：服务、规则、备份和 n 命令已清理\n'
 }
 
 menu() {
@@ -492,8 +605,9 @@ menu() {
             3) choose_rule index 修改 && edit_rule "$index" || true ;;
             4) choose_rule index 删除 && delete_rule "$index" || true ;;
             5) delete_rule -1 || true ;;
-            6|8) start_forwarding || true ;;
-            7) stop_forwarding || true ;;
+            6) printf '\n'; info '=== 启动转发 ==='; printf '\n'; start_forwarding || true ;;
+            7) printf '\n'; info '=== 停止转发 ==='; printf '\n'; stop_forwarding || true ;;
+            8) printf '\n'; info '=== 重启转发 ==='; printf '\n'; start_forwarding 重启 || true ;;
             9)
                 if update_script; then
                     pause_enter '  按回车进入新版菜单...'
@@ -539,7 +653,8 @@ main() {
     if [[ ! -e $CONF ]]; then printf '{"version":1,"rules":[]}\n' >"$CONF" || return 1; fi
     config_tool validate "$CONF" || return 1
     case ${1:-} in
-        --start|--reload) start_forwarding ;;
+        --start) start_forwarding ;;
+        --reload) start_forwarding 重启 ;;
         '') menu ;;
     esac
 }
