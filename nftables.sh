@@ -9,7 +9,7 @@ if [ -z "${BASH_VERSION:-}" ]; then
     exec bash "$0" "$@"
 fi
 
-SCRIPT_VERSION=1.0.2
+SCRIPT_VERSION=1.0.3
 DIR=/root/nftables
 CONF=$DIR/nftables.json
 RULES=$DIR/nftables.nft
@@ -31,7 +31,7 @@ read_input() {
     [[ $reply != [qQ] ]] || { MENU_CANCELLED=1; return 1; }
     printf -v "$1" '%s' "$reply"
 }
-pause_enter() { read -r -p '  按回车返回主菜单...' _ || INPUT_EOF=1; }
+pause_enter() { read -r -p "${1:-  按回车返回主菜单...}" _ || INPUT_EOF=1; }
 confirm() {
     local answer
     read_input answer '(Y/N): ' || return 1
@@ -404,8 +404,12 @@ update_script() (
     [[ ! -L $RT ]] || exit 1
     staged=$(mktemp "${RT%/*}/.nftables.XXXXXX") || exit 1
     install -m 755 "$temp" "$staged" && mv -f -- "$staged" "$RT" || exit 1
-    success '管理脚本已更新，下次运行 n 时加载'
+    success '管理脚本已更新'
 )
+reload_script() {
+    exec 9>&-
+    exec bash "$RT"
+}
 uninstall() {
     warn '卸载仅删除本脚本的转发表、配置、服务和管理命令。'
     warn '保留 Linux 内核、系统 nft 工具、其他防火墙规则及共享转发参数。'
@@ -475,7 +479,14 @@ menu() {
             5) delete_rule -1 || true ;;
             6|8) start_forwarding || true ;;
             7) stop_forwarding || true ;;
-            9) update_script || true ;;
+            9)
+                if update_script; then
+                    pause_enter '  按回车进入新版菜单...'
+                    ((INPUT_EOF)) && return 0
+                    reload_script
+                    return $?
+                fi
+                ;;
             10) uninstall && return 0 ;;
             0) return 0 ;;
             *) fail '无效选项' ;;
@@ -509,7 +520,7 @@ main() {
     case ${1:-} in
         --start|--reload) start_forwarding ;;
         --stop) stop_forwarding ;;
-        --update-script) update_script ;;
+        --update-script) update_script && reload_script ;;
         --uninstall) uninstall ;;
         '') menu ;;
     esac
