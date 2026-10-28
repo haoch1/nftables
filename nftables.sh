@@ -9,12 +9,13 @@ if [ -z "${BASH_VERSION:-}" ]; then
     exec bash "$0" "$@"
 fi
 
-SCRIPT_VERSION=1.0.3
+SCRIPT_VERSION=1.0.5
 DIR=/root/nftables
 CONF=$DIR/nftables.json
 RULES=$DIR/nftables.nft
 RT=/usr/local/bin/n
-UNIT=/etc/systemd/system/nftables.service
+SERVICE=nftables-forward
+UNIT=/etc/systemd/system/$SERVICE.service
 LOCK=/run/lock/nftables.lock
 SCRIPT_URL=https://raw.githubusercontent.com/haoch1/nftables/main/nftables.sh
 MARKER='nftables.sh managed'
@@ -152,16 +153,24 @@ ensure_tools() {
 }
 
 # 同名系统服务和内核表必须检查归属，不接管正在使用的防火墙。
+select_service() {
+    # 已由旧版本托管的服务沿用原名；新安装使用独立的转发服务。
+    local legacy=/etc/systemd/system/nftables.service
+    if [[ -f $legacy && ! -L $legacy ]] && grep -qxF "# $MARKER" "$legacy"; then
+        SERVICE=nftables
+        UNIT=$legacy
+    fi
+}
 unit_owned() { [[ -f $UNIT && ! -L $UNIT ]] && grep -qxF "# $MARKER" "$UNIT"; }
 check_unit() {
     if [[ -e $UNIT || -L $UNIT ]]; then
         unit_owned || { fail "已有同名服务，未覆盖：$UNIT"; return 1; }
-    elif systemctl is-active --quiet nftables || systemctl is-enabled --quiet nftables 2>/dev/null; then
-        fail '系统已有启用的 nftables 服务，请先确认其用途；本脚本未接管'
+    elif systemctl is-active --quiet "$SERVICE" || systemctl is-enabled --quiet "$SERVICE" 2>/dev/null; then
+        fail "已有启用的同名服务 $SERVICE，未接管"
         return 1
     fi
     local dropins
-    dropins=$(systemctl show nftables.service -p DropInPaths --value 2>/dev/null) || return 1
+    dropins=$(systemctl show "$SERVICE.service" -p DropInPaths --value 2>/dev/null) || return 1
     [[ -z $dropins ]] || { fail 'nftables 服务存在额外配置，未接管'; return 1; }
 }
 table_state() {
@@ -300,7 +309,7 @@ apply_config() (
             if [[ -f $temp/previous-table.nft ]]; then
                 load_rules "$temp/previous-table.nft" || failed=1
             else
-                ((active)) || systemctl stop nftables || true
+                ((active)) || systemctl stop "$SERVICE" || true
                 remove_rules || failed=1
             fi
         fi
@@ -317,23 +326,23 @@ apply_config() (
     ((state != 0)) || printf 'delete table ip nftables\n' >"$temp/check.nft"
     cat "$temp/nftables.nft" >>"$temp/check.nft" || exit 1
     nft -c -f "$temp/check.nft" || exit 1
-    systemctl is-active --quiet nftables && active=1
+    systemctl is-active --quiet "$SERVICE" && active=1
     cp -p "$CONF" "$temp/nftables.json" || exit 1
     [[ ! -f $RULES ]] || cp -p "$RULES" "$temp/previous.nft" || exit 1
     writing=1
     if [[ ! $candidate -ef $CONF ]]; then install -m 600 "$candidate" "$CONF" || status=1; fi
     if ((status == 0)); then install -m 600 "$temp/nftables.nft" "$RULES" || status=1; fi
     if ((status == 0)); then
-        if ((active)); then systemctl reload nftables || status=1
-        else systemctl start nftables || status=1; fi
+        if ((active)); then systemctl reload "$SERVICE" || status=1
+        else systemctl start "$SERVICE" || status=1; fi
     fi
     if ((status)); then
-        fail '应用失败，正在恢复原配置与内核规则；请查看 journalctl -u nftables'
+        fail "应用失败，正在恢复原配置与内核规则；请查看 journalctl -u $SERVICE"
         exit 1
     fi
     writing=0
     cp -p "$temp/nftables.json" "$CONF.bak" || warn '无法保存上次配置备份'
-    systemctl enable nftables >/dev/null || warn '规则已生效，但开机自启设置失败'
+    systemctl enable "$SERVICE" >/dev/null || warn '规则已生效，但开机自启设置失败'
     success '转发规则已保存并生效'
 )
 start_forwarding() {
@@ -342,7 +351,7 @@ start_forwarding() {
 }
 stop_forwarding() {
     check_unit || return 1
-    if unit_owned; then systemctl stop nftables || return 1; fi
+    if unit_owned; then systemctl stop "$SERVICE" || return 1; fi
     command -v nft >/dev/null 2>&1 && remove_rules || return 1
     success '转发已停止，保存的规则仍保留；已有连接可能继续到过期'
 }
@@ -394,12 +403,17 @@ delete_rule() {
 }
 
 update_script() (
-    local temp staged=''
+    local temp staged='' downloaded
     command -v curl >/dev/null 2>&1 || install_packages curl ca-certificates || exit 1
     temp=$(mktemp "$DIR/.nftables.XXXXXX") || exit 1
     trap 'rm -f -- "$temp"; [[ -z $staged ]] || rm -f -- "$staged"' EXIT
     curl -fLsS --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 60 "$SCRIPT_URL?$(date +%s)" -o "$temp" || exit 1
     if ! grep -qxF '# nftables.sh managed script' "$temp" || ! bash -n "$temp"; then fail '下载内容无效，原脚本已保留'; exit 1; fi
+    downloaded=$(sed -n 's/^SCRIPT_VERSION=//p' "$temp")
+    [[ $downloaded =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { fail '下载脚本版本无效，原脚本已保留'; exit 1; }
+    if [[ $(printf '%s\n%s\n' "$SCRIPT_VERSION" "$downloaded" | sort -V | tail -n 1) != "$downloaded" ]]; then
+        fail '下载地址返回了旧版本，当前脚本已保留，请稍后重试'; exit 1
+    fi
     [[ ! -e $RT ]] || grep -qxF '# nftables.sh managed script' "$RT" || exit 1
     [[ ! -L $RT ]] || exit 1
     staged=$(mktemp "${RT%/*}/.nftables.XXXXXX") || exit 1
@@ -414,13 +428,14 @@ uninstall() {
     warn '卸载仅删除本脚本的转发表、配置、服务和管理命令。'
     warn '保留 Linux 内核、系统 nft 工具、其他防火墙规则及共享转发参数。'
     confirm || return 1
-    check_unit || return 1
     if unit_owned; then
-        systemctl stop nftables && systemctl disable nftables || return 1
+        check_unit || return 1
+        systemctl stop "$SERVICE" && systemctl disable "$SERVICE" || return 1
     fi
     if command -v nft >/dev/null 2>&1; then remove_rules || return 1; fi
     if unit_owned; then rm -f -- "$UNIT" && systemctl daemon-reload || return 1; fi
     rm -f -- "$CONF" "$CONF.bak" "$RULES" || return 1
+    if [[ -f $DIR/nftables.sh.bak && ! -L $DIR/nftables.sh.bak ]] && grep -qxF '# nftables.sh managed script' "$DIR/nftables.sh.bak"; then rm -f -- "$DIR/nftables.sh.bak" || return 1; fi
     if [[ -f $RT && ! -L $RT ]] && grep -qxF '# nftables.sh managed script' "$RT"; then rm -f -- "$RT" || return 1; fi
     rmdir -- "$DIR" 2>/dev/null || warn "$DIR 内的未识别文件已保留"
     # 锁文件保留：删除已锁定的 inode 会允许另一个进程绕过互斥。
@@ -504,6 +519,7 @@ main() {
     esac
     [[ $(uname -s) == Linux && $EUID == 0 ]] || { fail '请在 Linux 上以 root 或 sudo 运行'; return 1; }
     command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]] || { fail '本版需要 systemd'; return 1; }
+    select_service
     umask 077
     trap 'exit 130' INT
     if ! command -v python3 >/dev/null 2>&1 || ! command -v flock >/dev/null 2>&1; then
@@ -515,13 +531,15 @@ main() {
     [[ ! -L $DIR && ! -L $CONF && ! -L $RULES ]] || { fail '管理目录或配置是符号链接，未修改'; return 1; }
     mkdir -p "$DIR" /run/lock || return 1
     acquire_menu_lock || return 1
+    case ${1:-} in
+        --stop) stop_forwarding; return $? ;;
+        --update-script) update_script && reload_script; return $? ;;
+        --uninstall) uninstall; return $? ;;
+    esac
     if [[ ! -e $CONF ]]; then printf '{"version":1,"rules":[]}\n' >"$CONF" || return 1; fi
     config_tool validate "$CONF" || return 1
     case ${1:-} in
         --start|--reload) start_forwarding ;;
-        --stop) stop_forwarding ;;
-        --update-script) update_script && reload_script ;;
-        --uninstall) uninstall ;;
         '') menu ;;
     esac
 }
