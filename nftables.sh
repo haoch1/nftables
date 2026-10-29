@@ -9,7 +9,7 @@ if [ -z "${BASH_VERSION:-}" ]; then
     exec bash "$0" "$@"
 fi
 
-SCRIPT_VERSION=1.0.9
+SCRIPT_VERSION=1.0.10
 DIR=/root/nftables
 CONF=$DIR/nftables.json
 RULES=$DIR/nftables.nft
@@ -21,12 +21,13 @@ LOCK=/run/lock/nftables.lock
 SCRIPT_URL=https://raw.githubusercontent.com/haoch1/nftables/main/nftables.sh
 MARKER='nftables.sh managed'
 BLUE=$'\033[1;36m' GREEN=$'\033[0;32m' RED=$'\033[0;31m' YELLOW=$'\033[0;33m' NC=$'\033[0m'
-MENU_CANCELLED=0 INPUT_EOF=0 MENU_IDLE=0
+MENU_CANCELLED=0 INPUT_EOF=0
 
 info() { printf '  %s[信息] %s%s\n' "$BLUE" "$*" "$NC"; }
 success() { printf '  %s[成功] %s%s\n' "$GREEN" "$*" "$NC"; }
 warn() { printf '  %s[注意] %s%s\n' "$YELLOW" "$*" "$NC"; }
 fail() { printf '  %s[错误] %s%s\n' "$RED" "$*" "$NC" >&2; return 1; }
+interrupt_exit() { printf '\n'; exit 130; }
 read_input() {
     local reply
     read -r -p "  $2" reply || { INPUT_EOF=1; return 1; }
@@ -252,35 +253,60 @@ clear_connections() {
     rm -f -- "$PENDING"
 }
 
-# 只接管等待主菜单输入的旧窗口；正在提交配置的窗口不受打断。
+# 按持锁文件描述符识别管理窗口，不向转发服务或其他程序发送信号。
+is_manager_pid() {
+    local pid=$1 interpreter script
+    [[ -r /proc/$pid/cmdline ]] || return 1
+    { IFS= read -r -d '' interpreter && IFS= read -r -d '' script; } <"/proc/$pid/cmdline" || return 1
+    [[ ${interpreter##*/} == bash || ${interpreter##*/} == sh ]] || return 1
+    [[ $script == "$RT" || ${script##*/} == nftables.sh ]] || return 1
+    [[ /proc/$pid/fd/9 -ef $LOCK.menu ]] || return 1
+    grep -q '^lock:.* FLOCK ' "/proc/$pid/fdinfo/9" 9>&- 2>/dev/null
+}
+lock_holder_pid() {
+    local pid='' fd
+    read -r pid _ <"$LOCK.menu" || true
+    if [[ $pid =~ ^[1-9][0-9]*$ ]] && ((pid != $$)) && is_manager_pid "$pid"; then
+        printf '%s\n' "$pid"; return 0
+    fi
+    for fd in /proc/[0-9]*/fd/9; do
+        [[ $fd -ef $LOCK.menu ]] || continue
+        pid=${fd#/proc/}; pid=${pid%%/*}
+        if ((pid != $$)) && is_manager_pid "$pid"; then printf '%s\n' "$pid"; return 0; fi
+    done
+    return 1
+}
+stop_manager() {
+    local pid=$1 signal=${2:-TERM} child
+    local -a children=()
+    if [[ -r /proc/$pid/task/$pid/children ]]; then
+        read -r -a children <"/proc/$pid/task/$pid/children" || true
+    fi
+    for child in "${children[@]}"; do
+        if is_manager_pid "$child"; then stop_manager "$child" "$signal"; fi
+    done
+    kill "-$signal" "$pid" 2>/dev/null || true
+}
 acquire_menu_lock() {
-    local holder='' state='' command='' attempt
+    local holder='' attempt
     exec 9>>"$LOCK.menu" || return 1
     if ! flock -n 9; then
-        read -r holder state <"$LOCK.menu" || true
-        if [[ $holder =~ ^[1-9][0-9]*$ && $state == idle && -r /proc/$holder/cmdline && /proc/$holder/fd/9 -ef $LOCK.menu ]]; then
-            command=$(tr '\0' '\n' <"/proc/$holder/cmdline") || return 1
-            case $command in
-                "bash"$'\n'"$RT" | "/bin/bash"$'\n'"$RT" | "/usr/bin/bash"$'\n'"$RT")
-                    info '检测到旧的空闲管理界面，正在自动接管...'
-                    kill -TERM "$holder" 2>/dev/null || return 1
-                    ;;
-                *) fail '管理锁被其他进程占用，未结束任何进程'; return 1 ;;
-            esac
-        else
-            fail "另一个 nftables 管理窗口正在执行操作${holder:+（PID: $holder）}，请稍后重试"
-            return 1
-        fi
-        for ((attempt=0; attempt<30; attempt++)); do
+        holder=$(lock_holder_pid) || holder=''
+        if [[ -z $holder ]] || ! is_manager_pid "$holder"; then fail '管理锁被其他进程占用，未结束任何进程'; return 1; fi
+        info '检测到旧的管理界面，正在自动接管...'
+        stop_manager "$holder"
+        for ((attempt=0; attempt<50; attempt++)); do
             flock -n 9 && break
+            # 兼容旧版输入界面忽略 TERM 的情况，按 Ctrl+C 的方式正常退出。
+            if ((attempt == 30)) && is_manager_pid "$holder"; then stop_manager "$holder" INT; fi
             sleep 0.1
         done
-        flock -n 9 || { fail '旧窗口尚未释放管理锁，请稍后重试'; return 1; }
+        flock -n 9 || { fail "旧管理脚本仍在执行操作，请稍后重试（PID: $holder）"; return 1; }
+        success '已关闭旧管理界面'
     fi
     [[ /proc/$BASHPID/fd/9 -ef $LOCK.menu ]] || { fail '管理锁已更新，请重新运行 n'; return 1; }
-    printf '%s busy\n' "$$" >"$LOCK.menu" || return 1
-    # 即使状态检查后用户开始操作，也不因接管信号中断写入。
-    trap 'if [[ ${MENU_IDLE:-0} == 1 ]]; then exit 0; fi' TERM HUP
+    printf '%s\n' "$$" >"$LOCK.menu" || return 1
+    trap 'exit 0' TERM HUP
 }
 
 nft_version() {
@@ -507,8 +533,11 @@ show_resolution() {
         warn "域名解析失败: $host，暂未获取到可用的 IP，可继续填写"
     fi
 }
-save_rule() {
-    local index=$1 port=$2 host=$3 target=$4 protocol=$5 name=${6:-} temp status error
+save_rule() (
+    local index=$1 port=$2 host=$3 target=$4 protocol=$5 name=${6:-} temp='' status error
+    trap '[[ -z $temp ]] || rm -f -- "$temp"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM HUP
     name=${name:-转发规则-$port}
     [[ ${#name} -le 60 && ! $name =~ [[:cntrl:]] ]] || { fail '备注限 60 字，不能包含控制字符'; return 1; }
     check_unit && ensure_tools || return 1
@@ -518,14 +547,13 @@ save_rule() {
     else
         fail "${error#配置错误：}"; status=1
     fi
-    rm -f -- "$temp"
     if ((status == 0)); then
         if ((index < 0)); then success '端口转发规则已添加并生效'; else success '转发规则已修改并生效'; fi
         printf '  转发模式: %s%s%s\n' "$GREEN" "${protocol^^}" "$NC"
         printf '  【%s】 本机端口: %s%s%s → 目标: %s%s:%s%s\n' "$name" "$GREEN" "$port" "$NC" "$GREEN" "$host" "$target" "$NC"
     fi
     return "$status"
-}
+)
 edit_rule() {
     local index=${1:--1} port='' host='' target='' protocol='' name='' value h error
     local host_prompt='请输入目标地址 (IP 或域名): ' target_label='请输入目标端口'
@@ -568,14 +596,19 @@ delete_rule() {
         mapfile -t selected < <(config_tool get "$CONF" "$index")
         selected_port=${selected[0]}
     fi
-    temp=$(mktemp "$DIR/.nftables.XXXXXX") || return 1
-    config_tool delete "$CONF" "$index" >"$temp" && check_unit && ensure_tools && apply_config "$temp"
-    status=$?
-    rm -f -- "$temp"
-    if ((status == 0)); then
-        if ((index == -1)); then success '所有端口转发规则已清空'; else success "已删除端口 ${selected_port} 的转发规则"; fi
-    fi
-    return "$status"
+    (
+        temp=''
+        trap '[[ -z $temp ]] || rm -f -- "$temp"' EXIT
+        trap 'exit 130' INT
+        trap 'exit 143' TERM HUP
+        temp=$(mktemp "$DIR/.nftables.XXXXXX") || return 1
+        config_tool delete "$CONF" "$index" >"$temp" && check_unit && ensure_tools && apply_config "$temp"
+        status=$?
+        if ((status == 0)); then
+            if ((index == -1)); then success '所有端口转发规则已清空'; else success "已删除端口 ${selected_port} 的转发规则"; fi
+        fi
+        return "$status"
+    )
 }
 
 update_script() (
@@ -620,6 +653,8 @@ uninstall() {
     if unit_owned; then
         check_unit || return 1
         systemctl stop "$SERVICE" && systemctl --quiet disable "$SERVICE" || return 1
+        if systemctl is-active --quiet "$SERVICE"; then fail '转发服务仍在运行，未删除文件'; return 1; fi
+        if systemctl is-enabled --quiet "$SERVICE"; then fail '转发服务仍启用开机自启，未删除文件'; return 1; fi
     fi
     remove_rules || return 1
     if unit_owned; then rm -f -- "$UNIT" && systemctl daemon-reload || return 1; fi
@@ -630,7 +665,6 @@ uninstall() {
         [[ $state == 1 ]] || { fail '内核规则未确认清理完成，卸载中止'; exit 1; }
         rm -f -- "$CONF" "$CONF.bak" "$RULES" "$PENDING" || exit 1
         if [[ -f $DIR/nftables.sh.bak && ! -L $DIR/nftables.sh.bak ]] && grep -qxF '# nftables.sh managed script' "$DIR/nftables.sh.bak"; then rm -f -- "$DIR/nftables.sh.bak" || exit 1; fi
-        if [[ -f $RT && ! -L $RT ]] && grep -qxF '# nftables.sh managed script' "$RT"; then rm -f -- "$RT" || exit 1; fi
         local temp
         for temp in "$DIR"/.nftables.??????; do
             [[ -e $temp || -L $temp ]] || continue
@@ -641,13 +675,23 @@ uninstall() {
             grep -qxF '# nftables.sh managed script' "$temp" || continue
             rm -f -- "$temp" || exit 1
         done
-        rmdir -- "$DIR" 2>/dev/null || warn "$DIR 内的未识别文件已保留"
+        local leftover
+        leftover=$(find "$DIR" -mindepth 1 -maxdepth 1 -print -quit) || exit 1
+        if [[ -n $leftover ]]; then warn "$DIR 内的未识别文件已保留"
+        else rmdir -- "$DIR" || { fail '管理目录清理失败，管理命令已保留'; exit 1; }; fi
         rm -f -- "$LOCK" "$LOCK.menu" || exit 1
+        if [[ -f $RT && ! -L $RT ]] && grep -qxF '# nftables.sh managed script' "$RT"; then rm -f -- "$RT" || exit 1; fi
         exec 8>&- 9>&-
         printf '  卸载完成：服务、规则、旧连接、备份和 n 命令已清理\n'
     )
 }
 
+run_menu_action() {
+    "$@"
+    local status=$?
+    ((status == 130)) && interrupt_exit
+    return "$status"
+}
 menu() {
     local choice index state version count header_pad core_width core_pad script_pad status
     while true; do
@@ -686,30 +730,26 @@ menu() {
         printf '  ║%39s║\n' ''
         printf '  ║  %s[0]%s  退出脚本%24s║\n' "$GREEN" "$BLUE" ''
         printf '  ╚═══════════════════════════════════════╝%s\n\n' "$NC"
-        MENU_IDLE=1
-        printf '%s idle\n' "$$" >"$LOCK.menu" || return 1
         read_input choice '请输入选项 [0-10]: '; status=$?
-        MENU_IDLE=0
-        printf '%s busy\n' "$$" >"$LOCK.menu" || return 1
         if ((status)); then ((INPUT_EOF)) && return 0; continue; fi
         case $choice in
-            1) edit_rule || true ;;
-            2) view_rules || true ;;
-            3) choose_rule index 修改 && edit_rule "$index" || true ;;
-            4) choose_rule index 删除 && delete_rule "$index" || true ;;
-            5) delete_rule -1 || true ;;
-            6) printf '\n'; info '=== 启动转发 ==='; printf '\n'; start_forwarding || true ;;
-            7) printf '\n'; info '=== 停止转发 ==='; printf '\n'; stop_forwarding || true ;;
-            8) printf '\n'; info '=== 重启转发 ==='; printf '\n'; start_forwarding 重启 || true ;;
+            1) run_menu_action edit_rule || true ;;
+            2) run_menu_action view_rules || true ;;
+            3) run_menu_action choose_rule index 修改 && run_menu_action edit_rule "$index" || true ;;
+            4) run_menu_action choose_rule index 删除 && run_menu_action delete_rule "$index" || true ;;
+            5) run_menu_action delete_rule -1 || true ;;
+            6) printf '\n'; info '=== 启动转发 ==='; printf '\n'; run_menu_action start_forwarding || true ;;
+            7) printf '\n'; info '=== 停止转发 ==='; printf '\n'; run_menu_action stop_forwarding || true ;;
+            8) printf '\n'; info '=== 重启转发 ==='; printf '\n'; run_menu_action start_forwarding 重启 || true ;;
             9)
-                if update_script; then
+                if run_menu_action update_script; then
                     pause_enter '  按回车进入新版菜单...'
                     ((INPUT_EOF)) && return 0
                     reload_script
                     return $?
                 fi
                 ;;
-            10) uninstall && return 0 ;;
+            10) run_menu_action uninstall && return 0 ;;
             0) return 0 ;;
             *) fail '无效选项' ;;
         esac
@@ -728,7 +768,7 @@ main() {
     command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]] || { fail '本版需要 systemd'; return 1; }
     select_service
     umask 077
-    trap 'exit 130' INT
+    trap interrupt_exit INT
     if ! command -v python3 >/dev/null 2>&1 || ! command -v flock >/dev/null 2>&1; then
         if [[ ${1:-} == --uninstall || ${1:-} == --service-* || ${1:-} == --stop ]]; then fail '请先安装 python3 和 flock (util-linux)'; return 1; fi
         install_packages python3 util-linux || return 1
