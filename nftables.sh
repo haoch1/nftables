@@ -9,7 +9,7 @@ if [ -z "${BASH_VERSION:-}" ]; then
     exec bash "$0" "$@"
 fi
 
-SCRIPT_VERSION=1.0.8
+SCRIPT_VERSION=1.0.9
 DIR=/root/nftables
 CONF=$DIR/nftables.json
 RULES=$DIR/nftables.nft
@@ -146,14 +146,26 @@ PY
 
 install_packages() {
     # 只补装缺失的包，不在管理菜单中升级系统 nftables。
-    if command -v apt-get >/dev/null 2>&1; then
-        apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-upgrade "$@"
-    elif command -v dnf >/dev/null 2>&1; then
-        dnf install -y "$@"
-    elif command -v yum >/dev/null 2>&1; then
-        yum install -y "$@"
+    local output status
+    info '正在安装所需组件，请稍候...'
+    if output=$(
+        exec 2>&1
+        if command -v apt-get >/dev/null 2>&1; then
+            apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-upgrade "$@"
+        elif command -v dnf >/dev/null 2>&1; then
+            dnf install -y "$@"
+        elif command -v yum >/dev/null 2>&1; then
+            yum install -y "$@"
+        else
+            fail '需要 apt-get、dnf 或 yum；本版适用于 systemd 系统'
+        fi
+    ); then
+        success '所需组件已安装'
     else
-        fail '需要 apt-get、dnf 或 yum；本版适用于 systemd 系统'
+        status=$?
+        fail '组件安装失败，具体原因如下：'
+        printf '%s\n' "$output" >&2
+        return "$status"
     fi
 }
 ensure_tools() {
@@ -409,7 +421,9 @@ apply_config() (
     systemctl --quiet enable "$SERVICE" || warn '规则已生效，但开机自启设置失败'
 )
 start_forwarding() {
-    local action=${1:-启动}
+    local action=${1:-启动} count
+    count=$(config_tool count "$CONF") || return 1
+    ((count > 0)) || { warn '暂无转发规则，请先添加'; return 1; }
     check_unit && ensure_tools || return 1
     apply_config "$CONF" || return 1
     success "转发已${action}"
